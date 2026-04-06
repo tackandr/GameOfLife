@@ -124,12 +124,16 @@ def simulate_cupy(
     # Pinned (page-locked) host memory enables DMA-based D2H transfers that
     # run independently of the CPU, allowing true GPU / CPU overlap.
     item_bytes = np.dtype(np.uint8).itemsize
+    n = chunk_size * height * width
     pinned_mems = [
-        cp.cuda.alloc_pinned_memory(chunk_size * height * width * item_bytes),
-        cp.cuda.alloc_pinned_memory(chunk_size * height * width * item_bytes),
+        cp.cuda.alloc_pinned_memory(n * item_bytes),
+        cp.cuda.alloc_pinned_memory(n * item_bytes),
     ]
+    # np.frombuffer requires an explicit count when wrapping a
+    # CuPy PinnedMemoryPointer, because the pointer does not always expose
+    # its size through the Python buffer protocol.
     pinned_arrs = [
-        np.frombuffer(pinned_mems[i], dtype=np.uint8).reshape(
+        np.frombuffer(pinned_mems[i], dtype=np.uint8, count=n).reshape(
             chunk_size, height, width
         )
         for i in range(2)

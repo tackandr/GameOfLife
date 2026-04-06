@@ -205,10 +205,10 @@ class TestSimulateCupy:
     """Integration tests for ``simulate_cupy``."""
 
     def _run(self, width=10, height=10, steps=5, chunk_size=2, seed=42):
+        import glob as _glob
         import game_of_life_cupy as mod
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
-            output = f.name
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = os.path.join(tmpdir, "sim.npy")
             mod.simulate_cupy(
                 width=width,
                 height=height,
@@ -217,10 +217,8 @@ class TestSimulateCupy:
                 output=output,
                 seed=seed,
             )
-            data = np.load(output)
-        finally:
-            os.unlink(output)
-        return data
+            chunk_files = sorted(_glob.glob(os.path.join(tmpdir, "sim_*.npy")))
+            return np.concatenate([np.load(f) for f in chunk_files], axis=0)
 
     def test_output_shape(self):
         width, height, steps = 8, 6, 4
@@ -258,19 +256,19 @@ class TestSimulateCupy:
         assert not np.array_equal(data1[0], data2[0])
 
     def test_file_written_to_disk(self):
-        """The .npy file must exist after the simulation."""
+        """At least one chunk .npy file must exist after the simulation."""
+        import glob as _glob
         import game_of_life_cupy as mod
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
-            output = f.name
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = os.path.join(tmpdir, "sim.npy")
             mod.simulate_cupy(width=5, height=5, steps=2, chunk_size=1,
                                output=output, seed=0)
-            assert os.path.isfile(output)
-        finally:
-            os.unlink(output)
+            chunk_files = _glob.glob(os.path.join(tmpdir, "sim_*.npy"))
+            assert len(chunk_files) > 0
 
     def test_matches_numpy_simulation(self):
         """CuPy and NumPy simulators must agree given the same seed."""
+        import glob as _glob
         from game_of_life import simulate
         import game_of_life_cupy as mod
 
@@ -278,16 +276,17 @@ class TestSimulateCupy:
 
         with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
             np_out = f.name
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
-            cp_out = f.name
         try:
             simulate(**common_kwargs, output=np_out)
-            mod.simulate_cupy(**common_kwargs, output=cp_out)
             np_data = np.load(np_out)
-            cp_data = np.load(cp_out)
         finally:
             os.unlink(np_out)
-            os.unlink(cp_out)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cp_out = os.path.join(tmpdir, "sim.npy")
+            mod.simulate_cupy(**common_kwargs, output=cp_out)
+            chunk_files = sorted(_glob.glob(os.path.join(tmpdir, "sim_*.npy")))
+            cp_data = np.concatenate([np.load(f) for f in chunk_files], axis=0)
 
         np.testing.assert_array_equal(cp_data, np_data)
 
@@ -302,17 +301,16 @@ class TestSimulateCupy:
 
     def test_profile_flag(self, capsys):
         """profile=True must produce correct output and print timing lines."""
+        import glob as _glob
         import game_of_life_cupy as mod
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
-            output = f.name
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = os.path.join(tmpdir, "sim.npy")
             mod.simulate_cupy(
                 width=10, height=10, steps=4, chunk_size=2,
                 output=output, seed=42, profile=True,
             )
-            data = np.load(output)
-        finally:
-            os.unlink(output)
+            chunk_files = sorted(_glob.glob(os.path.join(tmpdir, "sim_*.npy")))
+            data = np.concatenate([np.load(f) for f in chunk_files], axis=0)
 
         # Output must be correct regardless of profiling.
         assert data.shape == (5, 10, 10)
@@ -345,14 +343,11 @@ class TestSimulateCupy:
 
         monkeypatch.setattr(mod, "_nvtx_range", _TrackingRange)
 
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
-            out = f.name
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "sim.npy")
             # 4 steps / chunk_size=2 → 2 chunks → 2 kernel + 2 D2H ranges
             mod.simulate_cupy(width=5, height=5, steps=4, chunk_size=2,
                                output=out, seed=0)
-        finally:
-            os.unlink(out)
 
         kernel_ranges = [r for r in entered_ranges if r.startswith("kernel")]
         d2h_ranges = [r for r in entered_ranges if r.startswith("D2H")]
@@ -393,14 +388,11 @@ class TestSimulateCupy:
         mock_cp.cuda = _MockCudaTracking()
         monkeypatch.setattr(mod, "cp", mock_cp)
 
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
-            out = f.name
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "sim.npy")
             # 4 steps with chunk_size=2 → 2 chunks → both streams used
             mod.simulate_cupy(width=5, height=5, steps=4, chunk_size=2,
                                output=out, seed=0)
-        finally:
-            os.unlink(out)
 
         # Each stream must have been synchronised at least once.
         synced = {idx for (op, idx) in call_log if op == "sync"}

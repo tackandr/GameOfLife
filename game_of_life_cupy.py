@@ -7,12 +7,24 @@ Usage:
 The simulation runs entirely in a dedicated CuPy (CUDA) stream.  A pair of
 alternating output streams handle non-blocking device-to-host (D2H) transfers
 to pinned host memory.  After every chunk the D2H stream is synchronised and
-the CPU writes the accumulated frames to disk *while* the GPU simulation
-stream is already processing the next chunk.
+the CPU writes that chunk to its own file *while* the GPU simulation stream is
+already processing the next chunk.
+
+Output files
+------------
+Each chunk is saved as a separate ``.npy`` file derived from *output*::
+
+    {base}_000000.npy          — initial frame (generation 0)
+    {base}_000001-000010.npy   — chunk covering generations 1–10
+    {base}_000011-000020.npy   — chunk covering generations 11–20
+    …
+
+where ``{base}`` is *output* with its extension removed.
 """
 
 import argparse
 import contextlib
+import os
 from typing import Optional
 
 import numpy as np
@@ -83,7 +95,7 @@ def simulate_cupy(
     seed: Optional[int] = None,
     profile: bool = False,
 ) -> None:
-    """Run the GPU simulation and save every generation to *output*.
+    """Run the GPU simulation and save every generation to per-chunk files.
 
     Architecture
     ------------
@@ -99,6 +111,18 @@ def simulate_cupy(
       chunk *N* is already executing on the GPU while the CPU handles the
       disk write for chunk *N-1*.
 
+    Output files
+    ------------
+    Each chunk is written to its own ``.npy`` file so that no file grows
+    over time::
+
+        {base}_000000.npy          — initial frame (generation 0), shape (1, H, W)
+        {base}_000001-000010.npy   — chunk covering generations 1–10
+        {base}_000011-000020.npy   — chunk covering generations 11–20
+        …
+
+    where ``{base}`` is *output* with its extension (e.g. ``.npy``) stripped.
+
     Parameters
     ----------
     width, height:
@@ -108,7 +132,9 @@ def simulate_cupy(
     chunk_size:
         Generations per GPU chunk.
     output:
-        Destination ``.npy`` file.
+        Base path used to derive per-chunk filenames.  The extension is
+        stripped and ``_{start:06d}-{end:06d}.npy`` (or ``_000000.npy`` for
+        the initial frame) is appended for each chunk.
     seed:
         Optional RNG seed for reproducibility.
     profile:
@@ -133,14 +159,20 @@ def simulate_cupy(
     rng = np.random.default_rng(seed)
     initial = rng.integers(0, 2, size=(height, width), dtype=np.uint8)
 
-    total_frames = steps + 1
-    history = np.empty((total_frames, height, width), dtype=np.uint8)
-    history[0] = initial
+    # Derive the filename base and extension for per-chunk output files.
+    # e.g. output="simulation.npy"  →  base="simulation", ext=".npy"
+    base, ext = os.path.splitext(output)
+    if not ext:
+        ext = ".npy"
+
+    # Always save the initial frame (generation 0) to its own file first.
+    initial_path = f"{base}_000000{ext}"
+    np.save(initial_path, initial[np.newaxis])  # shape (1, H, W)
+    print(f"  Saved frame 0 to '{initial_path}'.")
 
     if steps == 0:
-        np.save(output, history)
         print(
-            f"\nDone. Simulation saved to '{output}' "
+            f"\nDone. Simulation saved as '{base}_*.npy' "
             f"(1 frame, grid {height}×{width})."
         )
         return
@@ -263,9 +295,9 @@ def simulate_cupy(
                     f"  [profile] chunk {prev_start}–{prev_end - 1}: "
                     f"kernel={sim_ms:.3f} ms, D2H={d2h_ms:.3f} ms"
                 )
-            history[prev_start:prev_end] = pinned_arrs[prev_buf][:prev_frames]
-            np.save(output, history[:prev_end])
-            print(f"  Saved {prev_end} frame(s) to '{output}'.")
+            chunk_path = f"{base}_{prev_start:06d}-{prev_end - 1:06d}{ext}"
+            np.save(chunk_path, pinned_arrs[prev_buf][:prev_frames])
+            print(f"  Saved frames {prev_start}–{prev_end - 1} to '{chunk_path}'.")
 
         pending = (buf_idx, frame, chunk_end, chunk_frames)
         frame = chunk_end
@@ -288,9 +320,9 @@ def simulate_cupy(
                 f"  [profile] chunk {prev_start}–{prev_end - 1}: "
                 f"kernel={sim_ms:.3f} ms, D2H={d2h_ms:.3f} ms"
             )
-        history[prev_start:prev_end] = pinned_arrs[prev_buf][:prev_frames]
-        np.save(output, history[:prev_end])
-        print(f"  Saved {prev_end} frame(s) to '{output}'.")
+        chunk_path = f"{base}_{prev_start:06d}-{prev_end - 1:06d}{ext}"
+        np.save(chunk_path, pinned_arrs[prev_buf][:prev_frames])
+        print(f"  Saved frames {prev_start}–{prev_end - 1} to '{chunk_path}'.")
 
     if profile:
         print(f"\n[profile] Total kernel time : {total_sim_ms:.3f} ms")
@@ -298,8 +330,8 @@ def simulate_cupy(
         print(f"[profile] Total GPU+D2H     : {total_sim_ms + total_d2h_ms:.3f} ms")
 
     print(
-        f"\nDone. Simulation saved to '{output}' "
-        f"({total_frames} frames, grid {height}×{width})."
+        f"\nDone. Simulation saved as '{base}_*.npy' "
+        f"({steps + 1} frames, grid {height}×{width})."
     )
 
 

@@ -170,10 +170,18 @@ def simulate_cupy(
         for i in range(2)
     ]
 
-    # Upload the initial grid and allocate a reusable GPU chunk buffer.
+    # Upload the initial grid and allocate one GPU chunk buffer *per slot*.
+    # Using separate buffers per slot is essential for true stream overlap:
+    # if both slots shared a single buffer, the CUDA driver would see a
+    # read-after-write hazard between the D2H transfer on out_streams[prev]
+    # and the simulation kernels on sim_stream, and would serialise the two
+    # streams to preserve correctness — defeating the double-buffering.
     with sim_stream:
         grid_gpu = cp.asarray(initial)
-    chunk_gpu = cp.empty((chunk_size, height, width), dtype=cp.uint8)
+    chunk_gpus = [
+        cp.empty((chunk_size, height, width), dtype=cp.uint8),
+        cp.empty((chunk_size, height, width), dtype=cp.uint8),
+    ]
 
     # Per-buffer CUDA event pairs for optional profiling.
     # sim_evs[i]  = (start, end) events bracketing the simulation kernels.
@@ -214,7 +222,7 @@ def simulate_cupy(
             with _profiling_range(f"kernel {frame}-{chunk_end - 1}"):
                 for i in range(chunk_frames):
                     grid_gpu = next_generation_cupy(grid_gpu)
-                    chunk_gpu[i] = grid_gpu
+                    chunk_gpus[buf_idx][i] = grid_gpu
             if profile:
                 sim_evs[buf_idx][1].record()  # kernel end (current stream)
 
@@ -226,7 +234,7 @@ def simulate_cupy(
         if profile:
             d2h_evs[buf_idx][0].record(out_stream)  # transfer start
         with _profiling_range(f"D2H {frame}-{chunk_end - 1}"):
-            chunk_gpu[:chunk_frames].get(
+            chunk_gpus[buf_idx][:chunk_frames].get(
                 out=pinned_arrs[buf_idx][:chunk_frames],
                 blocking=False,
                 stream=out_stream,

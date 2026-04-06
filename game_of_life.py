@@ -10,6 +10,8 @@ file so that memory usage stays bounded even for long simulations.
 """
 
 import argparse
+from typing import Optional
+
 import numpy as np
 
 
@@ -56,7 +58,7 @@ def simulate(
     steps: int,
     chunk_size: int,
     output: str,
-    seed: int | None = None,
+    seed: Optional[int] = None,
 ) -> None:
     """Run the simulation and save every generation to *output*.
 

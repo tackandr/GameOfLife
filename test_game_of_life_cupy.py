@@ -326,6 +326,39 @@ class TestSimulateCupy:
         assert "Total kernel time" in captured
         assert "Total D2H time" in captured
 
+    def test_nvtx_ranges_entered(self, monkeypatch):
+        """cupyx time_range must be entered for each chunk's kernels and D2H."""
+        import game_of_life_cupy as mod
+
+        entered_ranges = []
+
+        class _TrackingRange:
+            def __init__(self, name):
+                self._name = name
+
+            def __enter__(self):
+                entered_ranges.append(self._name)
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        monkeypatch.setattr(mod, "_nvtx_range", _TrackingRange)
+
+        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
+            out = f.name
+        try:
+            # 4 steps / chunk_size=2 → 2 chunks → 2 kernel + 2 D2H ranges
+            mod.simulate_cupy(width=5, height=5, steps=4, chunk_size=2,
+                               output=out, seed=0)
+        finally:
+            os.unlink(out)
+
+        kernel_ranges = [r for r in entered_ranges if r.startswith("kernel")]
+        d2h_ranges = [r for r in entered_ranges if r.startswith("D2H")]
+        assert len(kernel_ranges) == 2, f"kernel ranges: {kernel_ranges}"
+        assert len(d2h_ranges) == 2, f"D2H ranges: {d2h_ranges}"
+
     def test_streams_alternated(self, monkeypatch):
         """The two output streams must be used in alternating order."""
         import game_of_life_cupy as mod

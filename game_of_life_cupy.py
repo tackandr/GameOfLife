@@ -12,16 +12,34 @@ stream is already processing the next chunk.
 """
 
 import argparse
+import contextlib
 from typing import Optional
 
 import numpy as np
 
 try:
     import cupy as cp
+    from cupyx.profiler import time_range as _nvtx_range
     _CUPY_AVAILABLE = True
 except ImportError:  # pragma: no cover
     cp = None  # type: ignore[assignment]
+    _nvtx_range = None  # type: ignore[assignment]
     _CUPY_AVAILABLE = False
+
+
+def _profiling_range(name: str):
+    """Return a context manager that annotates *name* as an NVTX range.
+
+    When the process is launched via ``nsys profile`` (NVIDIA Nsight Systems),
+    each entered range appears as a labelled band in the timeline, making it
+    easy to distinguish simulation-kernel time from D2H-transfer time.
+
+    ``cupyx.profiler.time_range`` is used when available; otherwise a no-op
+    ``contextlib.nullcontext()`` is returned so the code path is unchanged.
+    """
+    if _nvtx_range is not None:
+        return _nvtx_range(name)
+    return contextlib.nullcontext()
 
 
 def next_generation_cupy(grid: "cp.ndarray") -> "cp.ndarray":
@@ -98,6 +116,13 @@ def simulate_cupy(
         simulation kernels and D2H transfer, print per-chunk timings, and
         print a total summary at the end.  Has no effect when ``False``
         (default).
+
+        ``cupyx.profiler.time_range`` NVTX annotations are always inserted
+        around each kernel batch and each D2H transfer, regardless of this
+        flag, so the timeline is visible in ``nsys profile`` without any extra
+        argument::
+
+            nsys profile python game_of_life_cupy.py --steps 100
     """
     if not _CUPY_AVAILABLE:
         raise RuntimeError(
@@ -186,9 +211,10 @@ def simulate_cupy(
         with sim_stream:
             if profile:
                 sim_evs[buf_idx][0].record()  # kernel start (current stream)
-            for i in range(chunk_frames):
-                grid_gpu = next_generation_cupy(grid_gpu)
-                chunk_gpu[i] = grid_gpu
+            with _profiling_range(f"kernel {frame}-{chunk_end - 1}"):
+                for i in range(chunk_frames):
+                    grid_gpu = next_generation_cupy(grid_gpu)
+                    chunk_gpu[i] = grid_gpu
             if profile:
                 sim_evs[buf_idx][1].record()  # kernel end (current stream)
 
@@ -199,11 +225,12 @@ def simulate_cupy(
         out_stream.wait_event(sim_stream.record())
         if profile:
             d2h_evs[buf_idx][0].record(out_stream)  # transfer start
-        chunk_gpu[:chunk_frames].get(
-            out=pinned_arrs[buf_idx][:chunk_frames],
-            blocking=False,
-            stream=out_stream,
-        )
+        with _profiling_range(f"D2H {frame}-{chunk_end - 1}"):
+            chunk_gpu[:chunk_frames].get(
+                out=pinned_arrs[buf_idx][:chunk_frames],
+                blocking=False,
+                stream=out_stream,
+            )
         if profile:
             d2h_evs[buf_idx][1].record(out_stream)  # transfer end
 

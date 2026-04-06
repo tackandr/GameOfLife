@@ -70,22 +70,11 @@ class _MockStream:
 class _MockCuda:
     Stream = _MockStream
 
-    class Event:
-        """No-op CUDA event mock (timing always reports 0.0 ms)."""
-
-        def record(self, stream=None):
-            pass
-
     @staticmethod
     def alloc_pinned_memory(size):
         # Return a plain numpy byte-array; supports the buffer protocol, so
         # ``np.frombuffer`` works on it exactly as on real pinned memory.
         return np.empty(size, dtype=np.uint8)
-
-    @staticmethod
-    def get_elapsed_time(start, end):
-        """Mock elapsed time between two events (always 0.0 ms)."""
-        return 0.0
 
 
 def _make_mock_cp():
@@ -298,31 +287,6 @@ class TestSimulateCupy:
             mod.simulate_cupy(
                 width=5, height=5, steps=1, chunk_size=1, output="/tmp/x.npy"
             )
-
-    def test_profile_flag(self, capsys):
-        """profile=True must produce correct output and print timing lines."""
-        import glob as _glob
-        import game_of_life_cupy as mod
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output = os.path.join(tmpdir, "sim.npy")
-            mod.simulate_cupy(
-                width=10, height=10, steps=4, chunk_size=2,
-                output=output, seed=42, profile=True,
-            )
-            chunk_files = sorted(_glob.glob(os.path.join(tmpdir, "sim_*.npy")))
-            data = np.concatenate([np.load(f) for f in chunk_files], axis=0)
-
-        # Output must be correct regardless of profiling.
-        assert data.shape == (5, 10, 10)
-        assert set(np.unique(data)).issubset({0, 1})
-
-        # Profiling lines must be printed for each chunk and as a summary.
-        captured = capsys.readouterr().out
-        assert "[profile]" in captured
-        assert "kernel=" in captured
-        assert "D2H=" in captured
-        assert "Total kernel time" in captured
-        assert "Total D2H time" in captured
 
     def test_nvtx_ranges_entered(self, monkeypatch):
         """cupyx time_range must be entered for each chunk's kernels and D2H."""

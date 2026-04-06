@@ -93,7 +93,6 @@ def simulate_cupy(
     chunk_size: int,
     output: str,
     seed: Optional[int] = None,
-    profile: bool = False,
 ) -> None:
     """Run the GPU simulation and save every generation to per-chunk files.
 
@@ -123,6 +122,12 @@ def simulate_cupy(
 
     where ``{base}`` is *output* with its extension (e.g. ``.npy``) stripped.
 
+    Use ``nsys profile`` to analyse kernel and transfer timings in the Nsight
+    Systems timeline — each chunk's simulation kernels and D2H transfer are
+    automatically annotated with ``cupyx.profiler.time_range`` NVTX ranges::
+
+        nsys profile python game_of_life_cupy.py --steps 100
+
     Parameters
     ----------
     width, height:
@@ -137,18 +142,6 @@ def simulate_cupy(
         the initial frame) is appended for each chunk.
     seed:
         Optional RNG seed for reproducibility.
-    profile:
-        When ``True``, record ``cp.cuda.Event`` timestamps around each chunk's
-        simulation kernels and D2H transfer, print per-chunk timings, and
-        print a total summary at the end.  Has no effect when ``False``
-        (default).
-
-        ``cupyx.profiler.time_range`` NVTX annotations are always inserted
-        around each kernel batch and each D2H transfer, regardless of this
-        flag, so the timeline is visible in ``nsys profile`` without any extra
-        argument::
-
-            nsys profile python game_of_life_cupy.py --steps 100
     """
     if not _CUPY_AVAILABLE:
         raise RuntimeError(
@@ -215,23 +208,6 @@ def simulate_cupy(
         cp.empty((chunk_size, height, width), dtype=cp.uint8),
     ]
 
-    # Per-buffer CUDA event pairs for optional profiling.
-    # sim_evs[i]  = (start, end) events bracketing the simulation kernels.
-    # d2h_evs[i]  = (start, end) events bracketing the D2H transfer.
-    # Both slots are reused on each double-buffer cycle; timing is read back
-    # after the corresponding out_stream is synchronised.
-    if profile:
-        sim_evs = [
-            (cp.cuda.Event(), cp.cuda.Event()),
-            (cp.cuda.Event(), cp.cuda.Event()),
-        ]
-        d2h_evs = [
-            (cp.cuda.Event(), cp.cuda.Event()),
-            (cp.cuda.Event(), cp.cuda.Event()),
-        ]
-        total_sim_ms = 0.0
-        total_d2h_ms = 0.0
-
     frame = 1
     buf_idx = 0
     # Pending tracks the D2H-in-flight chunk so it can be written to disk
@@ -249,30 +225,22 @@ def simulate_cupy(
 
         # ── 1. Enqueue simulation kernels on sim_stream (returns immediately).
         with sim_stream:
-            if profile:
-                sim_evs[buf_idx][0].record()  # kernel start (current stream)
             with _profiling_range(f"kernel {frame}-{chunk_end - 1}"):
                 for i in range(chunk_frames):
                     grid_gpu = next_generation_cupy(grid_gpu)
                     chunk_gpus[buf_idx][i] = grid_gpu
-            if profile:
-                sim_evs[buf_idx][1].record()  # kernel end (current stream)
 
         # ── 2. Enqueue non-blocking D2H transfer on the current output stream.
         #       The output stream waits for sim_stream to record an event,
         #       ensuring the transfer starts only after the kernels complete.
         out_stream = out_streams[buf_idx]
         out_stream.wait_event(sim_stream.record())
-        if profile:
-            d2h_evs[buf_idx][0].record(out_stream)  # transfer start
         with _profiling_range(f"D2H {frame}-{chunk_end - 1}"):
             chunk_gpus[buf_idx][:chunk_frames].get(
                 out=pinned_arrs[buf_idx][:chunk_frames],
                 blocking=False,
                 stream=out_stream,
             )
-        if profile:
-            d2h_evs[buf_idx][1].record(out_stream)  # transfer end
 
         # ── 3. While the GPU runs the kernels above, handle the *previous*
         #       chunk: sync its D2H stream (GPU-side work done) then write to
@@ -282,19 +250,6 @@ def simulate_cupy(
             prev_buf, prev_start, prev_end, prev_frames = pending
             # Synchronise ensures the D2H transfer for this chunk is complete.
             out_streams[prev_buf].synchronize()
-            if profile:
-                sim_ms = cp.cuda.get_elapsed_time(
-                    sim_evs[prev_buf][0], sim_evs[prev_buf][1]
-                )
-                d2h_ms = cp.cuda.get_elapsed_time(
-                    d2h_evs[prev_buf][0], d2h_evs[prev_buf][1]
-                )
-                total_sim_ms += sim_ms
-                total_d2h_ms += d2h_ms
-                print(
-                    f"  [profile] chunk {prev_start}–{prev_end - 1}: "
-                    f"kernel={sim_ms:.3f} ms, D2H={d2h_ms:.3f} ms"
-                )
             chunk_path = f"{base}_{prev_start:06d}-{prev_end - 1:06d}{ext}"
             np.save(chunk_path, pinned_arrs[prev_buf][:prev_frames])
             print(f"  Saved frames {prev_start}–{prev_end - 1} to '{chunk_path}'.")
@@ -307,27 +262,9 @@ def simulate_cupy(
     if pending is not None:
         prev_buf, prev_start, prev_end, prev_frames = pending
         out_streams[prev_buf].synchronize()
-        if profile:
-            sim_ms = cp.cuda.get_elapsed_time(
-                sim_evs[prev_buf][0], sim_evs[prev_buf][1]
-            )
-            d2h_ms = cp.cuda.get_elapsed_time(
-                d2h_evs[prev_buf][0], d2h_evs[prev_buf][1]
-            )
-            total_sim_ms += sim_ms
-            total_d2h_ms += d2h_ms
-            print(
-                f"  [profile] chunk {prev_start}–{prev_end - 1}: "
-                f"kernel={sim_ms:.3f} ms, D2H={d2h_ms:.3f} ms"
-            )
         chunk_path = f"{base}_{prev_start:06d}-{prev_end - 1:06d}{ext}"
         np.save(chunk_path, pinned_arrs[prev_buf][:prev_frames])
         print(f"  Saved frames {prev_start}–{prev_end - 1} to '{chunk_path}'.")
-
-    if profile:
-        print(f"\n[profile] Total kernel time : {total_sim_ms:.3f} ms")
-        print(f"[profile] Total D2H time    : {total_d2h_ms:.3f} ms")
-        print(f"[profile] Total GPU+D2H     : {total_sim_ms + total_d2h_ms:.3f} ms")
 
     print(
         f"\nDone. Simulation saved as '{base}_*.npy' "
@@ -378,15 +315,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Random seed for reproducibility (default: None).",
     )
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        default=False,
-        help=(
-            "Print per-chunk CUDA kernel and D2H transfer timings using "
-            "cp.cuda.Event (default: off)."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -407,7 +335,6 @@ def main() -> None:
         chunk_size=args.chunk_size,
         output=args.output,
         seed=args.seed,
-        profile=args.profile,
     )
 
 
